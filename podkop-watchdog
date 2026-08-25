@@ -65,6 +65,12 @@ STOP_AT=6                 # провалов подряд до гашения po
 RECOVERY_EVERY=300        # базовый интервал попыток подъёма в degraded, сек
 RECOVERY_MAX=1800         # потолок интервала после неудачных попыток, сек
 MISCONF_LOG_EVERY=3600    # как часто напоминать, что цель пробы не проксируется
+# Домены для проверки UPSTREAM-резолвера. Обязаны НЕ входить в списки podkop:
+# смысл именно в том, чтобы их резолв уходил во внешний DNS (DoH/DoT/udp), а не
+# отдавался локально из FakeIP-пула. Два, а не один — чтобы лежащий сам по себе
+# домен не считался отказом резолвера.
+UPSTREAM_HOSTS="openwrt.org debian.org"
+DNS_STOP_AT=6             # провалов upstream-резолва подряд до гашения podkop
 # Не фиксированные паузы, а ПОТОЛОК ожидания: проверяем каждые 5с и выходим
 # сразу, как заработало. Живой прогон 24.08.2026 показал, почему это важно:
 # холодный старт sing-box с пустым кэшем (после перезагрузки tmpfs пуст) не
@@ -87,6 +93,8 @@ F_BACKOFF="$STATE_DIR/backoff"
 F_MISCONF="$STATE_DIR/misconf_logged"
 F_LAST_RESTART="$STATE_DIR/last_restart"
 F_DNS_MOAN="$STATE_DIR/dns_moaned"
+F_DNS_FAILS="$STATE_DIR/dns_fails"
+F_UPSTREAM_MISCONF="$STATE_DIR/upstream_misconf"
 F_LOCK="$STATE_DIR/lock"
 
 log() {
@@ -302,6 +310,46 @@ boot_dns_ready() { sing_box_running && probe_singbox_dns; }
 # когда она нужнее всего.
 probe_singbox_dns() {
     run_bounded 8 nslookup fakeip.podkop.fyi 127.0.0.42
+}
+
+# Отвечает ли UPSTREAM-резолвер, к которому ходит sing-box (DoH, DoT или udp).
+#
+# Зачем отдельная проверка, если есть probe_chain. Затем, что probe_chain её не
+# заменяет, и однажды это стоило дома без интернета на два часа при полностью
+# зелёном логе. Домены из списков podkop получают FakeIP ЛОКАЛЬНО, внутри
+# sing-box, вообще не обращаясь наружу: проверено 25.08.2026, при наглухо
+# заблокированном DoH `cloudflare.com` продолжал резолвиться в 198.18.0.3, а
+# `fakeip.podkop.fyi` — в 198.18.0.4. То есть обе прежние проверки (probe_chain
+# и probe_singbox_dns) остаются зелёными, пока весь непроксируемый веб не
+# резолвится вовсе. Ровно это и произойдёт, если провайдер закроет DoH.
+#
+# Три исхода, и различать их обязательно:
+#   0 — резолвер жив: хоть один домен вернул НАСТОЯЩИЙ адрес
+#   1 — резолвер мёртв: все домены промолчали
+#   2 — судить не можем: домены вернулись FakeIP, то есть попали в списки
+#       podkop и проверка ослепла. Гасить podkop по такому «отказу» нельзя —
+#       это не отказ резолвера, а негодная цель проверки.
+probe_upstream_dns() {
+    local h out ip saw_fakeip=0
+    for h in $UPSTREAM_HOSTS; do
+        # Имя уходит в `sh -c`, поэтому берётся ТОЛЬКО из константы выше —
+        # никаких значений из конфига, которые пришлось бы валидировать.
+        out="$STATE_DIR/up.$$.out"
+        run_bounded 8 sh -c "nslookup '$h' 127.0.0.42 > '$out' 2>/dev/null"
+        # Первый IPv4, как в probe_target_proxied: busybox nslookup печатает и A,
+        # и AAAA, и порядок блоков не гарантирован.
+        ip=$(sed -n '/^Name:/,$p' "$out" 2>/dev/null | awk '
+            /^Address/ { for (i = 2; i <= NF; i++)
+                             if ($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) { print $i; exit } }')
+        rm -f "$out"
+        case "$ip" in
+            "")        continue ;;
+            198.18.*)  saw_fakeip=1 ;;
+            *)         return 0 ;;
+        esac
+    done
+    [ "$saw_fakeip" = 1 ] && return 2
+    return 1
 }
 
 # Проверено на роутере: busybox `pgrep -x sing-box` НЕ находит живой процесс,
@@ -554,6 +602,46 @@ go_degraded() {
     log info "режим degraded: интернет напрямую, проверяю прокси раз в ${RECOVERY_EVERY}с"
 }
 
+# Отдельная эскалация для отказа upstream-резолвера. Счётчик свой, а не общий с
+# probe_chain, потому что аварии разные: тут туннель ЖИВ и обычная проба зелёная,
+# лежит только резолв всего непроксируемого. Итог тем не менее тот же — degraded:
+# погашенный podkop возвращает dnsmasq прямой резолвер, и дом снова получает
+# работающий DNS вместо тишины.
+check_upstream_dns() {
+    local dfails now last rc
+    probe_upstream_dns; rc=$?
+    case "$rc" in
+        0)
+            dfails=$(state_get "$F_DNS_FAILS" 0)
+            [ "$dfails" -gt 0 ] && log info "upstream DNS снова отвечает (было провалов: $dfails)"
+            state_put "$F_DNS_FAILS" 0
+            ;;
+        2)
+            # Через дроссель: состояние держится, пока человек не поправит списки,
+            # а тик идёт раз в минуту.
+            now=$(date +%s)
+            last=$(state_get "$F_UPSTREAM_MISCONF" 0)
+            [ "$now" -lt "$last" ] && last=0
+            if [ $((now - last)) -ge "$MISCONF_LOG_EVERY" ]; then
+                state_put "$F_UPSTREAM_MISCONF" "$now"
+                log err "проверка upstream DNS ослепла: $UPSTREAM_HOSTS отдаются из FakeIP, значит попали в списки podkop. Смени UPSTREAM_HOSTS в /usr/bin/podkop-watchdog на домены вне списков"
+            fi
+            state_put "$F_DNS_FAILS" 0
+            ;;
+        *)
+            dfails=$(state_get "$F_DNS_FAILS" 0)
+            dfails=$((dfails + 1))
+            state_put "$F_DNS_FAILS" "$dfails"
+            log warn "upstream DNS не отвечает ($dfails/$DNS_STOP_AT) — туннель жив, но непроксируемые домены не резолвятся"
+            if [ "$dfails" -ge "$DNS_STOP_AT" ]; then
+                log err "$DNS_STOP_AT провалов upstream DNS подряд — гашу podkop, дом получит прямой резолвер"
+                state_put "$F_DNS_FAILS" 0
+                go_degraded
+            fi
+            ;;
+    esac
+}
+
 handle_armed() {
     local fails now last_moan last_restart
     fails=$(state_get "$F_FAILS" 0)
@@ -563,6 +651,10 @@ handle_armed() {
             log info "проба прошла, счётчик сброшен (было провалов: $fails)"
         fi
         state_put "$F_FAILS" 0
+        # Туннель жив — но это НЕ значит, что дом видит интернет: домены из
+        # списков резолвятся FakeIP локально, и обычная проба остаётся зелёной
+        # при наглухо мёртвом внешнем резолвере. Проверяем его отдельно.
+        check_upstream_dns
         return 0
     fi
 
@@ -655,12 +747,26 @@ handle_degraded() {
     run_bounded 60 /etc/init.d/podkop start
 
     if wait_for_chain "$SETTLE_START"; then
+        # Цепочка поднялась — но если upstream-резолвер всё ещё молчит, дом снова
+        # останется без непроксируемого веба, и через DNS_STOP_AT минут мы погасим
+        # podkop опять. Это флап каждые семь минут, каждый виток с рывком связи.
+        # Поэтому проверяем сразу и честно остаёмся в degraded с удвоенной паузой.
+        probe_upstream_dns
+        if [ "$?" = "1" ]; then
+            next=$((wait_for * 2))
+            [ "$next" -gt "$RECOVERY_MAX" ] && next="$RECOVERY_MAX"
+            state_put "$F_BACKOFF" "$next"
+            log warn "цепочка поднялась, но upstream DNS молчит — остаюсь на прямом интернете, следующая попытка через ${next}с"
+            podkop_down
+            return 0
+        fi
         state_put "$F_MODE" armed
         state_put "$F_FAILS" 0
         state_put "$F_BACKOFF" "$RECOVERY_EVERY"
         # Прошлый рестарт относился к уже закрытой аварии: не давать ему
         # запрещать первый рестарт в следующей.
         state_put "$F_LAST_RESTART" 0
+        state_put "$F_DNS_FAILS" 0
         log info "podkop восстановлен, режим armed"
     else
         # Хост отвечает по TCP, а цепочка не работает: протух ключ, сменился
@@ -1225,6 +1331,16 @@ case "$action" in
         if probe_chain; then echo "OK"; else echo "ПРОВАЛ"; fi
         printf 'sing-box:   '
         if probe_singbox_dns; then echo "DNS отвечает"; else echo "DNS молчит"; fi
+        # Отдельной строкой, потому что строка выше про него НЕ говорит: она
+        # спрашивает домен, который отдаётся из FakeIP локально, и остаётся
+        # зелёной при мёртвом внешнем резолвере.
+        printf 'upstream:   '
+        probe_upstream_dns
+        case "$?" in
+            0) echo "внешний DNS отвечает" ;;
+            2) echo "судить нельзя — $UPSTREAM_HOSTS попали в списки podkop" ;;
+            *) echo "внешний DNS МОЛЧИТ — непроксируемые домены не резолвятся" ;;
+        esac
         # Обе проверки завязаны на литералы — путь бинаря и имя nft-таблицы.
         # Сменит их новая версия podkop, и скрипт решит, что всё мертво, ничего
         # об этом не сказав. Показываем их явно: по телефону это единственный
