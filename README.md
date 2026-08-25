@@ -86,13 +86,18 @@ sh <(wget -O - https://raw.githubusercontent.com/aligro1/podkop-watchdog/main/un
 сработает — а полезешь ты за ней ровно тогда. Снимай руками:
 
 ```
-crontab -l | grep -v podkop-watchdog | crontab -
+crontab -l > /tmp/cron.bak && grep -v podkop-watchdog /tmp/cron.bak | crontab -
 sed -i '/podkop-watchdog/d' /etc/rc.local
-rm -f /usr/bin/podkop-watchdog
+rm -f /usr/bin/podkop-watchdog /usr/bin/podkop-watchdog.bak
+rm -rf /tmp/podkop-watchdog
 /etc/init.d/podkop start
 ```
 
-Четвёртая строка нужна, только если сторож успел погасить podkop. Файлы
+Первая строка написана так не для красоты. Привычное
+`crontab -l | grep -v ... | crontab -` — известная ловушка: упадёт `crontab -l`,
+и на вход уйдёт пустота, стерев заодно все остальные задания root.
+
+Последняя строка нужна, только если сторож успел погасить podkop. Файлы
 `/etc/podkop-ddns.conf` и `/etc/podkop-ddns.bak` останутся — в первом записан домен.
 
 # Что меняется в системе
