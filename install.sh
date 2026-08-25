@@ -472,8 +472,22 @@ fi
 if [ -n "$NEW_PROBE" ]; then
     say "  сторож    цель пробы: $PROBE_HOST -> $NEW_PROBE"
 fi
-if [ "$NO_RESTART" = "0" ]; then
+# Про рестарт говорим, только если он и правда будет. Рестарт делается в шаге 9
+# при changed=1, а changed зависит ровно от двух величин, и обе уже известны
+# здесь. Обещать прерывание связи и не прервать — то же враньё в выводе, что и
+# строка «DNS: doh 8.8.8.8 -> doh 8.8.8.8» там, где менять нечего.
+will_restart=0
+[ "$cur_cache" != "$CACHE_PATH" ] && will_restart=1
+if [ "$KEEP_DNS" = "0" ] && [ -n "$DNS_SERVER" ] \
+   && { [ "$cur_type" != "doh" ] || [ "$cur_srv" != "$DNS_SERVER" ]; }; then
+    will_restart=1
+fi
+if [ "$NO_RESTART" = "1" ]; then
+    say "  podkop    не перезапускаю (--no-restart)"
+elif [ "$will_restart" = "1" ]; then
     say "  podkop    будет перезапущен, связь ненадолго прервётся"
+else
+    say "  podkop    менять нечего, перезапуск не нужен"
 fi
 say ""
 say "  Настройки podkop при удалении НЕ откатываются — это описано в README."
