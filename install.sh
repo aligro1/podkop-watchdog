@@ -65,7 +65,13 @@ die()  { printf '\nОШИБКА: %s\n' "$*" >&2; exit 2; }
 # и разбор уходит в бесконечный цикл, намертво вешая ssh-сессию.
 need_val() {
     [ "$1" -ge 2 ] || die "у ключа $2 нет значения"
-    case "$3" in --*) die "у ключа $2 вместо значения стоит $3" ;; esac
+    case "$3" in
+        --*) die "у ключа $2 вместо значения стоит $3" ;;
+        # Пустая строка проходила обе проверки выше, и ключ молча превращался
+        # в «не задан»: человек написал --dns-server "", получил дефолтный
+        # Google и ни слова об этом.
+        "")  die "у ключа $2 пустое значение" ;;
+    esac
 }
 
 # Есть ли кого спрашивать. При запуске через `sh <(wget -O - URL)` скрипт
@@ -376,6 +382,9 @@ elif [ -n "$DNS_SERVER" ]; then
     valid_dns_server "$DNS_SERVER" \
         || die "--dns-server '$DNS_SERVER' не годится: нужен IP-адрес без схемы https://, например 8.8.8.8/dns-query"
     ok "DNS задан ключом: $DNS_SERVER"
+elif ! interactive; then
+    DNS_SERVER="$DNS_DEFAULT"
+    ok "терминала нет, беру по умолчанию: $DNS_SERVER"
 else
     say "  сейчас:  ${cur_type:-(не задан)} ${cur_srv:-(не задан)}"
     say ""
@@ -454,7 +463,10 @@ say "  sysupgrade.conf — пути, которые должны пережит�
 if [ "$cur_cache" != "$CACHE_PATH" ]; then
     say "  podkop    cache_path: ${cur_cache:-/tmp/sing-box/cache.db} -> $CACHE_PATH"
 fi
-if [ "$KEEP_DNS" = "0" ] && [ -n "$DNS_SERVER" ]; then
+# Только если действительно меняется: строка вида «doh 8.8.8.8 -> doh 8.8.8.8»
+# заставляет человека искать разницу там, где её нет.
+if [ "$KEEP_DNS" = "0" ] && [ -n "$DNS_SERVER" ] \
+   && { [ "$cur_type" != "doh" ] || [ "$cur_srv" != "$DNS_SERVER" ]; }; then
     say "  podkop    DNS: ${cur_type:-?} ${cur_srv:-?} -> doh $DNS_SERVER"
 fi
 if [ -n "$NEW_PROBE" ]; then
