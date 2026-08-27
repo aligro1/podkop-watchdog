@@ -242,9 +242,9 @@ main() {
     say ""
     say "Если всё же хочешь вернуть как было у podkop по умолчанию:"
     say ""
-    say "  uci set podkop.settings.dns_type='doh'"
-    say "  uci set podkop.settings.dns_server='1.1.1.1'"
-    say "  uci delete podkop.settings.cache_path"
+    say "  uci set podkop.settings.dns_type='udp'"
+    say "  uci set podkop.settings.dns_server='77.88.8.8'"
+    say "  uci set podkop.settings.cache_path='/tmp/sing-box/cache.db'"
     say "  uci commit podkop && /etc/init.d/podkop restart"
     say ""
     if [ -n "$domain_note" ] && [ "$PURGE" = "1" ]; then
