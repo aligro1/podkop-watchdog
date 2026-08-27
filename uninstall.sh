@@ -4,14 +4,26 @@
 #
 #   sh <(wget -O - https://raw.githubusercontent.com/aligro1/podkop-watchdog/main/uninstall.sh)
 #
-# Настройки podkop НЕ откатываются: DoH вместо открытого udp/53 и кэш rule-set
-# во флеше полезны сами по себе, а возврат на udp/53 — это возврат к резаному
-# провайдером резолву, то есть поломка, а не восстановление. Что именно осталось
-# изменённым и как вернуть руками, скрипт печатает в конце.
+# Настройки DNS и кэша podkop НЕ откатываются: DoH вместо открытого udp/53 и кэш
+# rule-set во флеше полезны сами по себе, а возврат на udp/53 это возврат к
+# резаному провайдером резолву, то есть поломка, а не восстановление. Что именно
+# осталось изменённым и как вернуть руками, скрипт печатает в конце.
+#
+# Откатывается одно: домен в строке подключения, который сторож подменял на IP.
+# Про это скрипт спрашивает, потому что без сторожа домен снова придётся
+# резолвить до подъёма туннеля.
+#
+# Перед запуском примени или отмени непринятые изменения в веб-интерфейсе: когда
+# мы возвращаем домен, делается `uci commit podkop`, и он применит заодно чужие
+# КОНСОЛЬНЫЕ правки. Черновик из вкладки LuCI сюда не попадает, rpcd держит его
+# в каталоге своей сессии, зато нажатое там позже "Save & Apply" перезапишет
+# возвращённый домен обратно.
 #
 # Ключи:
-#   --purge        снести и файлы памяти синхронизации (/etc/podkop-ddns.conf и .bak)
-#   --keep-files   не трогать файлы памяти и не спрашивать (поведение по умолчанию)
+#   --purge            снести и файлы памяти синхронизации (/etc/podkop-ddns.conf и .bak)
+#   --keep-files       не трогать файлы памяти (поведение по умолчанию)
+#   --restore-domain   вернуть домен, не спрашивая; нужен при запуске без терминала
+#   --keep-ip          не возвращать домен и не спрашивать
 #
 # Всё тело — в функции main, вызов последней строкой файла. Это обязательно при
 # запуске через `sh <(wget ...)`: ash исполняет по мере чтения, и оборванная
@@ -24,6 +36,7 @@ set -u
 DEST="/usr/bin/podkop-watchdog"
 CRONTAB_FILE="/etc/crontabs/root"
 STATE_DIR="/tmp/podkop-watchdog"
+CONF="/etc/podkop-watchdog.conf"
 DDNS_CONF="/etc/podkop-ddns.conf"
 DDNS_BAK="/etc/podkop-ddns.bak"
 LOCK_WAIT=180     # сек ожидания чужого прогона watchdog
@@ -33,6 +46,251 @@ say()  { printf '%s\n' "$*"; }
 ok()   { printf '  ✓ %s\n' "$*"; }
 warn() { printf '  ! %s\n' "$*"; }
 die()  { printf '\nОШИБКА: %s\n' "$*" >&2; exit 2; }
+
+# Есть ли кого спрашивать. Через `sh <(wget -O - URL)` stdin остаётся
+# терминалом и вопросы работают; через `wget -O - URL | sh` он занят самим
+# скриптом, и спрашивать нечего.
+interactive() { [ -t 0 ]; }
+
+# Да/нет с ответом по умолчанию "да". Без терминала возвращает НЕТ, а не "да":
+# единственный вопрос здесь про возврат домена в конфиг, и решать это за
+# человека молча нельзя, см. restore_domains.
+confirm() {
+    local ans
+    interactive || return 1
+    printf '%s [Y/n] ' "$1"
+    read -r ans || ans="y"
+    # Кириллица здесь не украшение: промпт русский, а "нет" и "н" без неё
+    # читаются как согласие, и единственный вопрос в файле переписывает конфиг
+    # podkop и перезапускает прокси.
+    case "${ans:-y}" in
+        [Nn]*|[Нн]*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+# Ограничитель времени для init-скриптов. Такой же, как в install.sh, и по той
+# же причине: на этом роутере init-скрипт podkop наблюдаемо подвисал. Здесь цена
+# зависания выше, чем там: cron уже снят, домен уже закоммичен, и повисший
+# насмерть деинсталлятор оставляет роутер с полуснятым сторожем.
+# Дескриптор 9 в фоновых ветках закрываем: на нём висит общий лок сторожа,
+# который держит этот скрипт. Унаследованный фоном лок пережил бы наш выход, и
+# следующий прогон сторожа (если человек поставит его заново) встал бы в очередь
+# к процессу, которого уже нет.
+run_bounded() {
+    limit="$1"; shift
+    setsid "$@" >/dev/null 2>&1 9>&- &
+    cmd_pid=$!
+    setsid sh -c "sleep $limit; kill -9 -$cmd_pid 2>/dev/null || kill -9 $cmd_pid 2>/dev/null" 9>&- &
+    killer_pid=$!
+    wait "$cmd_pid" 2>/dev/null
+    rc=$?
+    kill -9 -"$killer_pid" 2>/dev/null || kill -9 "$killer_pid" 2>/dev/null
+    wait "$killer_pid" 2>/dev/null
+    return "$rc"
+}
+
+# Отвечает ли DNS от sing-box. Тот же признак живого podkop, что и на шаге 3.
+podkop_dns_alive() {
+    nslookup fakeip.podkop.fyi 127.0.0.42 >/dev/null 2>&1
+}
+
+# Разбор строки подключения на "всё до @", хост, порт и хвост. Логика повторяет
+# ddns_parse_url из podkop-watchdog, где и объяснено, почему второй '@' и IPv6
+# в скобках считаются неразбираемыми. Копия, а не вызов оригинала: секция
+# сторожа тянет за собой log, state_get и лок, а нам нужны четыре подстроки.
+ps_parse() {
+    local url="$1" rest hostport
+    PS_PRE=""; PS_HOST=""; PS_PORT=""; PS_POST=""
+    case "$url" in *://*@*) ;; *) return 1 ;; esac
+    PS_PRE="${url%%@*}"
+    rest="${url#*@}"
+    case "$rest" in *@*) return 1 ;; esac
+    hostport="${rest%%[?#/]*}"
+    PS_POST="${rest#"$hostport"}"
+    case "$hostport" in
+        \[*) return 1 ;;
+        *:*) ;;
+        *) return 1 ;;
+    esac
+    PS_PORT="${hostport##*:}"
+    PS_HOST="${hostport%:*}"
+    case "$PS_PORT" in ""|*[!0-9]*) return 1 ;; esac
+    [ -n "$PS_HOST" ] || return 1
+    return 0
+}
+
+# Годится ли строка на роль домена. Та же проверка, что ddns_valid_domain в
+# стороже: домен уходит в proxy_string, и строка вида `-` или `1.2` там сделает
+# ссылку, с которой podkop не поднимется.
+ps_valid_domain() {
+    case "$1" in
+        ""|-*|*[!A-Za-z0-9.-]*) return 1 ;;
+    esac
+    case "$1" in
+        *.*) case "${1##*.}" in ""|*[!A-Za-z]*) return 1 ;; esac; return 0 ;;
+    esac
+    return 1
+}
+
+ps_is_ipv4_literal() {
+    case "$1" in
+        *[!0-9.]*)   return 1 ;;
+        *.*.*.*.*)   return 1 ;;
+        *.*.*.*)     return 0 ;;
+        *)           return 1 ;;
+    esac
+}
+
+# Сложить в LEFT_ON_IP все домены из памяти, чьи секции сейчас стоят на IP.
+# Нужна на ранних выходах из restore_domains: инвариант "домен, который мы не
+# вернули, обязан быть назван в конце" держится и тогда, когда до разбора по
+# секциям дело не дошло.
+left_on_ip_from_memory() {
+    local section domain ip rest ps
+    [ -f "$DDNS_CONF" ] || return 0
+    while read -r section domain ip rest <&8 || [ -n "$section" ]; do
+        case "$section" in ""|\#*) section=""; continue ;; esac
+        ps=$(uci -q get "podkop.$section.proxy_string")
+        if [ -n "$ps" ] && ps_parse "$ps" && ps_is_ipv4_literal "$PS_HOST" \
+           && [ -n "$domain" ] && [ "$domain" != "-" ]; then
+            LEFT_ON_IP="${LEFT_ON_IP}${LEFT_ON_IP:+, }$domain"
+        fi
+        section=""
+    done 8< "$DDNS_CONF"
+}
+
+# Вернуть домены в строки подключения там, где IP поставили мы.
+#
+# Пока сторож работал, в podkop.<секция>.proxy_string стоял IP, а домен лежал в
+# нашей памяти. После удаления вернуть его будет неоткуда, и человек останется
+# с адресом, который однажды протухнет.
+#
+# Меняем только те секции, где в конфиге стоит ровно ТОТ IP, что записан третьим
+# полем: иначе адрес сменили руками, и наш домен там уже не при чём.
+restore_domains() {
+    # restored держим через пробел: по нему идёт сверка `case " $restored "`,
+    # и запятая внутри сломала бы совпадение для всех секций, кроме последней.
+    local section domain ip rest ps changed=0 restored="" restored_dom=""
+    if [ ! -f "$DDNS_CONF" ]; then
+        ok "памяти синхронизации нет, возвращать нечего"
+        return 0
+    fi
+    if [ "$RESTORE" = "0" ]; then
+        ok "домен не возвращаю (--keep-ip)"
+        left_on_ip_from_memory
+        return 0
+    fi
+    # Чужие незакоммиченные правки: `uci commit podkop` применит и их вместе с
+    # нашей. Сторож в такой ситуации просто уходит до следующего тика
+    # (ddns_sync_one), а у нас следующего тика не будет, поэтому спрашиваем.
+    if [ -n "$(uci changes podkop 2>/dev/null)" ]; then
+        warn "в конфиге podkop есть незакоммиченные правки:"
+        uci changes podkop 2>/dev/null | sed 's/^/      /'
+        warn "возврат домена их закоммитит заодно."
+        if [ "$RESTORE" != "1" ] && ! confirm "  Всё равно возвращать домен?"; then
+            ok "домен не возвращаю, правки не трогаю"
+            left_on_ip_from_memory
+            return 0
+        fi
+    fi
+    # Читаем через дескриптор 8, а не через stdin: внутри цикла мы спрашиваем
+    # человека, и обычный `< "$DDNS_CONF"` забрал бы у read его ответ. Условие
+    # `|| [ -n "$section" ]` обрабатывает последнюю строку без завершающего
+    # перевода: файл лежит в /etc, правится руками и переживает прошивку.
+    while read -r section domain ip rest <&8 || [ -n "$section" ]; do
+        case "$section" in ""|\#*) section=""; continue ;; esac
+        ps=$(uci -q get "podkop.$section.proxy_string")
+        if [ -z "$ps" ]; then section=""; continue; fi
+        if ! ps_parse "$ps"; then
+            warn "секция '$section': строку подключения не разобрал, не трогаю"
+            ps_is_ipv4_literal "$PS_HOST" && LEFT_ON_IP="${LEFT_ON_IP}${LEFT_ON_IP:+, }${domain:-?}"
+            section=""; continue
+        fi
+        # Всё, из-за чего домен вернуть нельзя, обязано попасть в LEFT_ON_IP,
+        # если в конфиге сейчас IP-литерал: этот список человек читает вместо
+        # сорока строк вывода, и молча потерянный домен там страшнее лишнего.
+        if ! ps_valid_domain "${domain:-}"; then
+            ps_is_ipv4_literal "$PS_HOST" \
+                && LEFT_ON_IP="${LEFT_ON_IP}${LEFT_ON_IP:+, }?"
+            section=""; continue
+        fi
+        if [ -z "$ip" ] || [ "$ip" = "-" ] || [ "$PS_HOST" != "$ip" ]; then
+            if ps_is_ipv4_literal "$PS_HOST"; then
+                ok "секция '$section': в конфиге $PS_HOST, а ставили мы ${ip:--}, не трогаю"
+                LEFT_ON_IP="${LEFT_ON_IP}${LEFT_ON_IP:+, }$domain"
+            fi
+            section=""; continue
+        fi
+        if [ "$RESTORE" != "1" ] && ! interactive; then
+            LEFT_ON_IP="${LEFT_ON_IP}${LEFT_ON_IP:+, }$domain"
+            warn "секция '$section': терминала нет, домен $domain не возвращаю (см. --restore-domain)"
+            section=""; continue
+        fi
+        if [ "$RESTORE" != "1" ]; then
+            say ""
+            say "  секция '$section': сейчас $ip, до установки был домен $domain"
+            say "  Домен резолвится ДО подъёма туннеля, и именно поэтому роутер мог"
+            say "  не подниматься после перезагрузки. Без сторожа это вернётся."
+            if ! confirm "  Вернуть $domain?"; then
+                LEFT_ON_IP="${LEFT_ON_IP}${LEFT_ON_IP:+, }$domain"
+                ok "секция '$section': оставляю $ip"
+                section=""; continue
+            fi
+        fi
+        # warn вместо die: одна неудачная секция не повод бросать деинсталляцию
+        # на середине, оставив снятый cron и неудалённые файлы.
+        if uci set "podkop.$section.proxy_string=${PS_PRE}@${domain}:${PS_PORT}${PS_POST}"; then
+            changed=1
+            restored="${restored}${restored:+ }$section"
+            restored_dom="${restored_dom}${restored_dom:+, }$domain"
+            ok "секция '$section': вернул $domain"
+        else
+            warn "секция '$section': не смог записать proxy_string, оставляю $ip"
+            LEFT_ON_IP="${LEFT_ON_IP}${LEFT_ON_IP:+, }$domain"
+        fi
+        section=""
+    done 8< "$DDNS_CONF"
+
+    [ "$changed" = "1" ] || return 0
+
+    if ! uci commit podkop; then
+        # Правка осталась бы висеть в /tmp/.uci и применилась бы при первом
+        # чужом `uci commit podkop`, уже без нашего ведома.
+        uci revert podkop 2>/dev/null
+        warn "uci commit podkop не прошёл, правку откатил: в конфиге остался IP"
+        LEFT_ON_IP="${LEFT_ON_IP}${LEFT_ON_IP:+, }$restored_dom"
+        return 0
+    fi
+    ok "конфиг podkop записан (секции: $(echo $restored | tr ' ' ','))"
+
+    if ! run_bounded 60 /etc/init.d/podkop restart; then
+        warn "podkop restart завершился нештатно или не уложился в 60с"
+    fi
+    waited=0
+    while [ "$waited" -lt "$START_WAIT" ]; do
+        podkop_dns_alive && break
+        waited=$((waited + 5))
+        sleep 5
+    done
+    if podkop_dns_alive; then
+        ok "podkop поднялся с доменом за ${waited}с, DNS отвечает"
+        return 0
+    fi
+    # Домен может не резолвиться, это ровно та авария, ради которой сторож и
+    # писался, только сторожа уже нет. Печатаем готовый откат: IP у нас на
+    # руках, а искать его человеку будет негде.
+    warn "podkop не поднялся за ${START_WAIT}с после возврата домена."
+    warn "Интернет сейчас может не работать. Вернуть адрес обратно:"
+    while read -r section domain ip rest <&8 || [ -n "$section" ]; do
+        case "$section" in ""|\#*) section=""; continue ;; esac
+        case " $restored " in *" $section "*) ;; *) section=""; continue ;; esac
+        ps=$(uci -q get "podkop.$section.proxy_string")
+        ps_parse "$ps" && say "  uci set podkop.$section.proxy_string='${PS_PRE}@${ip}:${PS_PORT}${PS_POST}'"
+        section=""
+    done 8< "$DDNS_CONF"
+    say "  uci commit podkop && /etc/init.d/podkop restart"
+}
 
 # Снять строку из crontab, сохранив чужие задания.
 #
@@ -56,11 +314,18 @@ cron_del() {
 
 main() {
     PURGE=0
+    # 1 возвращать домен молча, 0 не возвращать, пусто спросить.
+    RESTORE=""
+    # Домены, которые так и остались IP-адресами в конфиге: человек отказался
+    # или терминала не было. О них напоминаем в самом конце.
+    LEFT_ON_IP=""
 
     while [ $# -gt 0 ]; do
         case "$1" in
-            --purge)      PURGE=1; shift ;;
-            --keep-files) PURGE=0; shift ;;
+            --purge)          PURGE=1; shift ;;
+            --keep-files)     PURGE=0; shift ;;
+            --restore-domain) RESTORE=1; shift ;;
+            --keep-ip)        RESTORE=0; shift ;;
             *) die "неизвестный ключ: $1" ;;
         esac
     done
@@ -69,6 +334,15 @@ main() {
     say ""
 
     [ "$(id -u)" = "0" ] || die "запускать надо от root"
+
+    # Список того, что реально зовёт этот скрипт. Раньше проверки не было вовсе,
+    # но раньше он и не перезапускал podkop, и не снимал ожидающие прогоны:
+    # молча не сработавший pgrep вернул бы IP обратно уже после "Готово", а
+    # отсутствие setsid оставило бы podkop с доменом и без перезапуска.
+    for c in uci crontab flock nslookup grep sed awk cut tr pgrep setsid kill; do
+        command -v "$c" >/dev/null 2>&1 \
+            || die "нет команды $c, без неё снимать сторожа небезопасно"
+    done
 
     found=0
     [ -f "$DEST" ] && found=1
@@ -121,6 +395,33 @@ main() {
     cron_del "$DEST check"
     cron_del "$DEST ddns"
 
+    # Тик ddns, успевший стартовать до снятия cron, не выходит, а ЖДЁТ общий лок
+    # до 60с. Лок держим мы, до самого конца прогона, поэтому он получит его
+    # сразу после нашего выхода: увидит в proxy_string домен, сочтёт его свежей
+    # ручной правкой и подменит обратно на IP, заодно воскресив только что
+    # снесённый файл памяти. Человеку при этом уже сказали "вернул домен".
+    # Раз лок у нас, всё живое по этому пути это ожидающие, а не работающие.
+    # Ищем `ddns` и `boot`: лока ждут только они. Тик `check` берёт его через
+    # flock -n и выходит сразу, а `status` лока не трогает вовсе. `boot` живёт
+    # своей подоболочкой из rc.local (`sleep 120; ... boot`), поэтому вырезанная
+    # строка его уже не отменяет, а первое, что он делает после захвата лока, это
+    # синхронизация адреса. Шаблон с аргументом заодно не цепляет чужие командные
+    # строки, где путь к сторожу просто упомянут.
+    # Своих предков в этот список собираем не для красоты: pgrep ищет по всей
+    # командной строке, и если путь к сторожу упомянут в команде, которой
+    # запустили сам деинсталлятор, под нож пойдёт собственная сессия. У busybox
+    # ps нет -o, поэтому родителя читаем из /proc.
+    self_chain=""
+    chain_pid=$$
+    while [ -n "$chain_pid" ] && [ "$chain_pid" != "1" ] && [ "$chain_pid" != "0" ]; do
+        self_chain="$self_chain $chain_pid"
+        chain_pid=$(cut -d' ' -f4 "/proc/$chain_pid/stat" 2>/dev/null)
+    done
+    for pid in $(pgrep -f "$DEST ddns" 2>/dev/null; pgrep -f "$DEST boot" 2>/dev/null); do
+        case " $self_chain " in *" $pid "*) continue ;; esac
+        kill "$pid" 2>/dev/null && ok "снят ожидающий прогон синхронизации (pid $pid)"
+    done
+
     if grep -qF "$DEST boot" /etc/rc.local 2>/dev/null; then
         # Файл собираем заново, а НЕ вырезаем строку через sed: в ней есть '&',
         # а в правой части sed-подстановки это «весь совпавший текст». На вставке
@@ -148,8 +449,12 @@ main() {
     say ""
     say "3. Проверяю состояние podkop"
     if [ "$mode" = "degraded" ]; then
-        warn "watchdog держал podkop погашенным — поднимаю обратно"
-        /etc/init.d/podkop start >/dev/null 2>&1
+        warn "watchdog держал podkop погашенным, поднимаю обратно"
+        # Через ограничитель и с закрытым fd 9 по той же причине, что и рестарт
+        # ниже: подвисший init-скрипт иначе повесит деинсталляцию навсегда, уже
+        # сняв cron, а демоны podkop унаследуют наш лок.
+        run_bounded 60 /etc/init.d/podkop start \
+            || warn "podkop start завершился нештатно или не уложился в 60с"
         waited=0
         while [ "$waited" -lt "$START_WAIT" ]; do
             if nslookup fakeip.podkop.fyi 127.0.0.42 >/dev/null 2>&1; then
@@ -169,17 +474,25 @@ main() {
         ok "podkop не был погашен watchdog'ом, трогать его не нужно"
     fi
 
-    # --- 4. sysupgrade.conf ----------------------------------------------
+    # --- 4. вернуть домен в строку подключения ---------------------------
+    #
+    # Здесь, а не позже: cron уже снят, значит сторож не влезет посреди правки,
+    # а файл памяти ещё на месте.
+    say ""
+    say "4. Возвращаю домен в строку подключения"
+    restore_domains
+
+    # --- 5. sysupgrade.conf ----------------------------------------------
     #
     # /etc/sing-box/ НЕ снимаем: cache_path остаётся настроенным на
     # /etc/sing-box/cache.db, и кэш rule-set обязан пережить прошивку. Снимем —
     # вернётся холодный старт, ради ухода от которого кэш туда и переносили.
     say ""
-    say "4. Чищу /etc/sysupgrade.conf"
+    say "5. Чищу /etc/sysupgrade.conf"
     if [ -f /etc/sysupgrade.conf ]; then
         cp /etc/sysupgrade.conf /etc/sysupgrade.conf.bak
         removed=0
-        for f in "$DEST" "$DDNS_CONF" "$DDNS_BAK"; do
+        for f in "$DEST" "$CONF" "$DDNS_CONF" "$DDNS_BAK"; do
             grep -qxF "$f" /etc/sysupgrade.conf 2>/dev/null || continue
             grep -vxF "$f" /etc/sysupgrade.conf > /tmp/sysupgrade.conf.new 2>/dev/null \
                 && mv /tmp/sysupgrade.conf.new /etc/sysupgrade.conf \
@@ -196,10 +509,15 @@ main() {
         ok "файла нет, чистить нечего"
     fi
 
-    # --- 5. файлы ---------------------------------------------------------
+    # --- 6. файлы ---------------------------------------------------------
     say ""
-    say "5. Удаляю файлы"
+    say "6. Удаляю файлы"
     rm -f "$DEST" "$DEST.bak" && ok "$DEST удалён"
+    # Конфиг удаляем всегда, в отличие от файлов памяти: он весь состоит из
+    # значений, которые установщик заведёт заново из умолчаний.
+    # .new сносим заодно: он остаётся, если установщику оборвали запись.
+    rm -f "$CONF.new"
+    [ -f "$CONF" ] && rm -f "$CONF" && ok "$CONF удалён"
     if [ -d "$STATE_DIR" ]; then
         # Лок мы держим на файле внутри этого каталога. Удаление каталога при
         # открытом дескрипторе законно: файл доживёт до выхода из скрипта.
@@ -223,7 +541,7 @@ main() {
         fi
     fi
 
-    # --- 6. что осталось --------------------------------------------------
+    # --- 7. что осталось --------------------------------------------------
     say ""
     say "Готово. Watchdog снят."
     say ""
@@ -247,9 +565,10 @@ main() {
     say "  uci set podkop.settings.cache_path='/tmp/sing-box/cache.db'"
     say "  uci commit podkop && /etc/init.d/podkop restart"
     say ""
-    if [ -n "$domain_note" ] && [ "$PURGE" = "1" ]; then
-        say "В LuCI сейчас стоит IP-адрес сервера, а не домен. Домен был: $domain_note"
-        say "Впиши ссылку с доменом обратно, если он тебе нужен."
+    if [ -n "$LEFT_ON_IP" ]; then
+        say "В конфиге podkop остался IP-адрес сервера, а не домен: $LEFT_ON_IP"
+        say "Впиши ссылку с доменом обратно через веб-интерфейс podkop, если"
+        say "он тебе нужен."
         say ""
     fi
 }
