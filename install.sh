@@ -25,7 +25,7 @@
 #   --dns-server URL   какой DoH использовать, без схемы https://
 #   --keep-dns         не трогать настройки DNS вообще
 #   --no-restart       не перезапускать podkop (изменения вступят позже)
-#   --log-level УР     уровень логов сторожа: off, err, warn или info
+#   --log-level УР     уровень записи сторожа в syslog: off, err, warn или info (журнал он не трогает)
 #   --src ПУТЬ         взять файл podkop-watchdog отсюда, а не качать
 #   --yes              не задавать вопросов, брать значения по умолчанию
 #
@@ -57,7 +57,7 @@ CONF="/etc/podkop-watchdog.conf"
 LOG_LEVEL=""
 CRONTAB_FILE="/etc/crontabs/root"
 SRC=""
-NEED_KB=300          # скрипт 64К + кэш 128К + запас
+NEED_KB=700          # скрипт ~120К и его .bak, кэш 128К, журнал ~130К и его .new при обрезке, запас
 SETTLE_MAX=90        # сколько ждать подъёма цепочки после рестарта
 
 say()  { printf '%s\n' "$*"; }
@@ -590,6 +590,7 @@ say ""
 say "  файлы     $DEST"
 say "            $CONF: настройки, создастся если его ещё нет"
 say "            /etc/podkop-ddns.conf и .bak — память синхронизации, заполнятся сами"
+say "            /etc/podkop-watchdog.log — журнал событий, заполнится сам (до 500 строк)"
 say "  cron      две строки: проверка раз в минуту, синхронизация раз в 5 минут"
 say "  rc.local  одна строка: проверка через 120с после загрузки"
 say "  sysupgrade.conf — пути, которые должны пережить прошивку"
@@ -672,6 +673,7 @@ if [ ! -f "$CONF" ]; then
 # После правки ничего перезапускать не нужно: файл читается на каждом запуске.
 
 # Сколько сторож пишет в syslog: off (молчать), err, warn или info.
+# Журнал событий /etc/podkop-watchdog.log этот ключ не трогает: туда пишется всегда.
 LOG_LEVEL="${LOG_LEVEL:-info}"
 
 # Контрольный сайт: по нему проверяется, жив ли туннель. Обязан уходить в
@@ -780,7 +782,7 @@ keep=$(sysupgrade -l 2>/dev/null)
 # /etc целиком там не значится). Без строки кэш rule-set пропадёт при первой же
 # прошивке, и вернётся холодный старт, ради которого его и переносили из tmpfs.
 [ -f /etc/sysupgrade.conf ] || : > /etc/sysupgrade.conf
-for f in "$DEST" "$CONF" /etc/podkop-ddns.conf /etc/podkop-ddns.bak /etc/sing-box/ \
+for f in "$DEST" "$CONF" /etc/podkop-ddns.conf /etc/podkop-ddns.bak /etc/podkop-watchdog.log /etc/sing-box/ \
          "$CRONTAB_FILE" /etc/rc.local; do
     printf '%s\n' "$keep" | grep -qxF "$f" && continue
     grep -qxF "$f" /etc/sysupgrade.conf 2>/dev/null && continue
@@ -889,7 +891,7 @@ else
             warn "$PROBE_HOST НЕ резолвится в FakeIP за ${SETTLE_MAX}с — podkop не перехватил"
             warn "dnsmasq. Трафик идёт напрямую, прокси не работает."
         fi
-        warn "Установка выполнена. Смотри:  logread | grep podkop-watchdog"
+        warn "Установка выполнена. Смотри:  $DEST log"
         warn "                              $DEST status"
     fi
 fi
@@ -908,7 +910,7 @@ else
     say "Установлено, но НЕ проверено. Дальше:"
 fi
 say "  состояние   $DEST status"
-say "  лог         logread | grep podkop-watchdog"
+say "  журнал      $DEST log"
 say "  домен       вписывай обычной ссылкой в интерфейсе podkop, сторож подхватит"
 say "  удаление    sh <(wget -O - $REPO_RAW/uninstall.sh)"
 exit "$rc"

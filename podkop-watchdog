@@ -49,6 +49,8 @@
 #   armed    — podkop работает, следим
 #   degraded — podkop погашен нами, интернет идёт напрямую, ждём оживления
 #
+# Журнал событий: /etc/podkop-watchdog.log, хвост показывает `podkop-watchdog log`.
+#
 # Запуск: из cron раз в минуту. Ставится /usr/bin/podkop-watchdog.
 
 set -u
@@ -94,11 +96,99 @@ FALLBACK_DNS="8.8.8.8"    # если podkop не сохранил оригина
 SING_BOX_BIN=$(command -v sing-box 2>/dev/null)
 [ -n "$SING_BOX_BIN" ] || SING_BOX_BIN="/usr/bin/sing-box"
 
+# Свой журнал во флеше, рядом с syslog. Без него аварию не разобрать: кольцевой
+# буфер syslog 128 КБ, и на живом роутере его за 45 минут целиком съедал
+# hostapd (одно устройство, не прошедшее авторизацию Wi-Fi). Авария 07.10.2026
+# длилась с 18:46 до 20:06, а смотреть её пришли в 21:57 — от неё не осталось ни
+# строки, хотя сторож всё это время что-то делал.
+#
+# Пишется сюда только то, что сторож и так говорит в лог: события (провал,
+# гашение, попытка подъёма), а не тики. Обычная авария это десяток-другой строк.
+# Бывают и сообщения, которые повторяются каждую минуту, пока поломка не
+# пройдёт (таймаут команды, повтор восстановления dnsmasq): их повторы гасит
+# journal_put. Потолок держит размер файла на случай, когда не помогло и это.
+JOURNAL="/etc/podkop-watchdog.log"
+JOURNAL_MAX=500           # строк, около 130 КБ; дорос — обрезаем до JOURNAL_KEEP
+JOURNAL_KEEP=400          # запас, чтобы не переписывать файл на каждой строке
+JOURNAL_REPEAT_WINDOW=3600  # сек, в течение которых повтор строки не пишется
+
+# Строка журнала с текущим штампом. Отдельно от journal_put, потому что ею же
+# выписываются итоги по подавленным повторам.
+journal_line() {
+    # 2>/dev/null ПЕРЕД >>: перенаправления идут слева направо, и в обратном
+    # порядке busybox успевает напечатать "can't create" (флеш read-only) в
+    # stderr. Из-под cron это просто мусор в /dev/null, но при ручном запуске
+    # `podkop-watchdog check` он вылезает человеку в терминал посреди вывода.
+    printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S %Z')" "$1" 2>/dev/null >> "$JOURNAL"
+}
+
+# Повторы гасятся на час по КАЖДОЙ строке, а не только по соседним. Есть
+# сообщения, которые при затяжной поломке идут каждую минуту, и идут циклом
+# из нескольких разных строк (ветка dnsmasq в degraded, таймауты проб). Гашение
+# только соседних повторов такой цикл не ловило, и за сутки он вытеснял бы из
+# потолка строку о том, с чего авария началась, а ради неё журнал и заведён.
+#
+# Учёт в tmpfs ($F_JSEEN), строка на сообщение: <первый раз> <последний раз
+# ЧЧ:ММ> <подавлено> <таб> <сообщение>. Через час строка снова пишется в журнал,
+# а перед ней итог: сколько раз она повторялась и когда последний. Пока час не
+# вышел, подавленное видно в `podkop-watchdog log` (оно читает этот же учёт). После
+# перезагрузки учёт пропадает вместе с невыписанными итогами: это цена того, что
+# счётчики не пишутся во флеш на каждый тик.
+journal_put() {
+    local key now hm n tmp
+    # Таб разделяет поля учёта, в тексте ему не место.
+    key=$(printf '%s %s' "$1" "$2" | tr '\t' ' ')
+    now=$(date +%s 2>/dev/null) || now=0
+    hm=$(date +%H:%M 2>/dev/null)
+    tmp="$F_JSEEN.$$"
+    # awk выписывает в stdout итоги по истёкшим записям (их надо отправить в
+    # журнал), учёт без них кладёт в $tmp, а в код возврата отдаёт, подавлена ли
+    # текущая строка: 0 подавлена, 1 писать.
+    if [ -f "$F_JSEEN" ]; then
+        awk -F '\t' -v now="$now" -v hm="$hm" -v w="$JOURNAL_REPEAT_WINDOW" \
+            -v key="$key" -v tmp="$tmp" '
+            BEGIN { hit = 0 }
+            {
+                split($1, h, " ")   # h[1] первый раз, h[2] последний ЧЧ:ММ, h[3] подавлено
+                if (now < h[1] || now - h[1] >= w) {
+                    if (h[3] > 0) print "(ещё " h[3] " раз, последний в " h[2] ") " $2
+                    next
+                }
+                if ($2 == key) { hit = 1; h[2] = hm; h[3]++ }
+                print h[1] " " h[2] " " h[3] "\t" $2 > tmp
+            }
+            END { close(tmp); exit hit ? 0 : 1 }' "$F_JSEEN" 2>/dev/null > "$tmp.sum"
+        if [ "$?" = "0" ]; then
+            mv "$tmp" "$F_JSEEN" 2>/dev/null
+            rm -f "$tmp.sum"
+            return 0
+        fi
+        while IFS= read -r n; do
+            journal_line "info повторы: $n"
+        done < "$tmp.sum"
+        rm -f "$tmp.sum"
+        if [ -f "$tmp" ]; then mv "$tmp" "$F_JSEEN" 2>/dev/null; else : > "$F_JSEEN"; fi
+    fi
+    journal_line "$key" || return 0
+    printf '%s %s 0\t%s\n' "$now" "$hm" "$key" 2>/dev/null >> "$F_JSEEN"
+    n=$(cat "$JOURNAL" 2>/dev/null | wc -l)
+    if [ "${n:-0}" -gt "$JOURNAL_MAX" ]; then
+        tail -n "$JOURNAL_KEEP" "$JOURNAL" 2>/dev/null > "$JOURNAL.new" \
+            && mv "$JOURNAL.new" "$JOURNAL"
+        rm -f "$JOURNAL.new"
+    fi
+}
+
 # $1 это уровень (info/warn/err), дальше текст. Фильтр по LOG_LEVEL из конфига:
 # на роутере с маленьким кольцевым буфером syslog лишние строки вытесняют чужие,
 # и человеку нужен способ приглушить нас, не снимая сторожа.
+#
+# Журнал фильтр НЕ касается. LOG_LEVEL спасает чужие строки в общем буфере, а у
+# журнала буфер свой; приглушённый журнал вернул бы ровно ту слепоту, ради
+# которой его завели.
 log() {
     local level="$1"; shift
+    journal_put "$level" "$*"
     case "$LOG_LEVEL" in
         off)  return 0 ;;
         err)  [ "$level" = "err" ] || return 0 ;;
@@ -118,6 +208,8 @@ F_DNS_MOAN="$STATE_DIR/dns_moaned"
 F_DNS_FAILS="$STATE_DIR/dns_fails"
 F_UPSTREAM_MISCONF="$STATE_DIR/upstream_misconf"
 F_LOCK="$STATE_DIR/lock"
+F_JSEEN="$STATE_DIR/journal_seen"
+F_DOWN_AT="$STATE_DIR/podkop_down_at"
 
 # --- файл настроек ---------------------------------------------------------
 #
@@ -170,8 +262,11 @@ DEF_PROBE_MATCH="$PROBE_MATCH"
 # Жалобы на конфиг идут через дроссель: негодное значение держится сутками, а
 # прогон случается каждую минуту. Без него 1440 строк в сутки выдавят из
 # кольцевого буфера syslog всё остальное, включая то, ради чего в лог и лезут.
+# $2 необязательное имя дросселя. Свой дроссель нужен жалобе, которая не должна
+# теряться за чужой: у общего дросселя вторая ошибка конфига в тот же час
+# молча съедала первую.
 conf_moan() {
-    local now last f="$STATE_DIR/conf_moaned"
+    local now last f="$STATE_DIR/conf_moaned${2:+_$2}"
     now=$(date +%s 2>/dev/null) || now=0
     last=$(cat "$f" 2>/dev/null) || last=0
     case "$last" in ""|*[!0-9]*) last=0 ;; esac
@@ -230,10 +325,13 @@ unset conf_v
 
 case "$LOG_LEVEL" in
     off|err|warn|info) ;;
-    *) # Своим logger, а не log(): сломан ровно тот ключ, который им управляет.
-       logger -t podkop-watchdog -p daemon.err -- \
-           "LOG_LEVEL='$LOG_LEVEL' в $CONF не из списка off/err/warn/info, беру info"
-       LOG_LEVEL=info ;;
+    *) # Сначала чиним уровень, потом жалуемся: log() внутри conf_moan смотрит
+       # ровно на этот ключ. Через дроссель, как и прочие жалобы на конфиг, и
+       # заодно в журнал.
+       conf_bad_level="$LOG_LEVEL"
+       LOG_LEVEL=info
+       conf_moan "LOG_LEVEL='$conf_bad_level' в $CONF не из списка off/err/warn/info, беру info" log_level
+       unset conf_bad_level ;;
 esac
 
 # Точка обязательна по той же причине, что и в ddns_valid_domain: без неё это не
@@ -328,7 +426,9 @@ run_bounded() {
     kill -9 -"$killer_pid" 2>/dev/null || kill -9 "$killer_pid" 2>/dev/null
     wait "$killer_pid" 2>/dev/null
     if [ "$rc" -gt 128 ]; then
-        log err "команда '$*' не уложилась в ${limit}с, снята вместе с потомками"
+        # PID из имён временных файлов (up.123.out) вырезаем: с ним каждая строка
+        # уникальна, и журнал не может погасить её повторы.
+        log err "команда '$(printf '%s' "$*" | sed 's/\.[0-9][0-9]*\.out/.out/g')' не уложилась в ${limit}с, снята вместе с потомками"
     fi
     return "$rc"
 }
@@ -435,11 +535,48 @@ probe_proxy_host() {
     curl -sk --connect-timeout 6 --max-time 8 -o /dev/null "https://$ep" 2>/dev/null
 }
 
+# Сводка "жив ли прямой интернет" одной строкой для журнала. Звать только при
+# погашенном podkop: тогда dnsmasq смотрит в обычный резолвер, и все три пробы
+# меряют провайдера, а не sing-box.
+#
+# Нужна, чтобы по журналу отличать две аварии, которые для человека выглядят
+# одинаково: "лёг прокси" (сторож гасит podkop, и это помогает) и "лёг
+# провайдер" (гашение не помогает ничему, а виноватым выглядит сторож). Пробы
+# три, потому что каждая отсекает своё: внешний DNS мимо dnsmasq — жив ли
+# канал вообще; DNS роутера — вернул ли force_restore_dns рабочий резолвер;
+# HTTPS — доходит ли трафик дальше резолва. ya.ru выбран как сайт, которого
+# заведомо нет в списках podkop и который из России открывается напрямую.
+DIRECT_HOST="ya.ru"
+DIRECT_DNS="77.88.8.8"    # Яндекс.DNS, мимо dnsmasq
+
+direct_summary() {
+    local ext loc web
+    if run_bounded 8 nslookup "$DIRECT_HOST" "$DIRECT_DNS"; then ext="да"; else ext="НЕТ"; fi
+    if run_bounded 8 nslookup "$DIRECT_HOST" 127.0.0.1; then loc="да"; else loc="НЕТ"; fi
+    if curl -s --connect-timeout 6 --max-time 10 -o /dev/null "https://$DIRECT_HOST" 2>/dev/null; then
+        web="да"
+    else
+        web="НЕТ"
+    fi
+    printf 'прямой интернет: внешний DNS %s, DNS роутера %s, https://%s %s' \
+        "$ext" "$loc" "$DIRECT_HOST" "$web"
+}
+
 # Цепочка работает И трафик реально идёт в туннель. Вторая половина
 # обязательна: если podkop не смог перехватить dnsmasq, контрольный сайт резолвится
 # в реальный IP и curl проходит НАПРЯМУЮ — probe_chain вернёт успех при
 # полностью нерабочем прокси. Без этой проверки watchdog объявил бы
 # восстановление, ушёл в armed и больше не пробовал бы вообще.
+# Какое звено цепочки отказало, словами для журнала. chain_really_proxied
+# склеивает две пробы через &&, и по её коду не отличить "сайт не уходит в
+# FakeIP" (dnsmasq не перехвачен) от "в FakeIP уходит, но туннель не везёт".
+chain_diag() {
+    local fk ch
+    if probe_target_proxied; then fk="да"; else fk="НЕТ"; fi
+    if probe_chain; then ch="да"; else ch="НЕТ"; fi
+    printf '%s в FakeIP: %s, ответ через туннель: %s' "$PROBE_HOST" "$fk" "$ch"
+}
+
 chain_really_proxied() {
     probe_target_proxied && probe_chain
 }
@@ -715,6 +852,10 @@ force_restore_dns() {
 # половина сайтов не грузится» и не имеет ни одной подсказки почему.
 podkop_down() {
     run_bounded 45 /etc/init.d/podkop stop || log err "podkop stop завершился нештатно"
+    # Метка для handle_foreign_start: sing-box, запущенный раньше неё, это
+    # остаток нашей же остановки, а не чужой старт. Ставится в начале, а не в
+    # конце: всё, что podkop поднимет позже, обязано считаться новым.
+    state_put "$F_DOWN_AT" "$(date +%s)"
     sleep 3
     force_restore_dns
 
@@ -777,6 +918,7 @@ go_degraded() {
         log warn "127.0.0.42 всё ещё отвечает — sing-box не остановился полностью"
     fi
     log info "режим degraded: интернет напрямую, проверяю прокси раз в ${RECOVERY_EVERY}с"
+    log info "$(direct_summary)"
 }
 
 # Отдельная эскалация для отказа upstream-резолвера. Счётчик свой, а не общий с
@@ -887,8 +1029,70 @@ handle_armed() {
     fi
 }
 
+# Выход из degraded. Путей два (сторож поднял сам, или podkop подняли мимо
+# него), и состояние после них обязано быть одинаковым.
+go_armed() {
+    state_put "$F_MODE" armed
+    state_put "$F_FAILS" 0
+    state_put "$F_BACKOFF" "$RECOVERY_EVERY"
+    # Прошлый рестарт относился к уже закрытой аварии: не давать ему
+    # запрещать первый рестарт в следующей.
+    state_put "$F_LAST_RESTART" 0
+    state_put "$F_DNS_FAILS" 0
+}
+
+# podkop работает, хотя сторож держит его погашенным: человек нажал Start в
+# LuCI или поднял его другим путём. Так закончилась авария 07.10.2026, и тогда
+# это читалось как поломка: проверка ниже про dnsmasq видела 127.0.0.42, писала
+# "всё ещё смотрит" и force_restore_dns снимала перехват DNS с живого sing-box.
+# Код возврата 0 значит "ситуацию разобрали, дальше не идти".
+handle_foreign_start() {
+    local diag
+    sing_box_started_after "$(state_get "$F_DOWN_AT" 0)" || return 1
+    # Старт из LuCI мог ещё не доехать: sing-box уже есть, перехвата ещё нет.
+    # Ждём столько же, сколько дали бы собственному старту.
+    if chain_really_proxied || wait_for_chain "$SETTLE_START"; then
+        go_armed
+        log info "podkop подняли мимо сторожа (вручную или другим путём), туннель работает — режим armed"
+        return 0
+    fi
+    # Диагноз снимается после ожидания, и туннель мог доехать ровно между:
+    # тогда он покажет "да/да", и гасить нельзя.
+    diag=$(chain_diag)
+    case "$diag" in
+        *НЕТ*) ;;
+        *) go_armed
+           log info "podkop подняли мимо сторожа, туннель заработал с опозданием ($diag) — режим armed"
+           return 0 ;;
+    esac
+    log warn "podkop подняли мимо сторожа, но туннель за ${SETTLE_START}с не заработал ($diag) — гашу обратно, дом на прямом интернете"
+    podkop_down
+    log info "$(direct_summary)"
+    return 0
+}
+
+# Запущен ли sing-box ПОЗЖЕ метки $1 (секунды эпохи). Нужно, чтобы отличать
+# чужой старт от остатка нашей же остановки: если podkop stop не снял sing-box,
+# простая проверка "процесс есть" на каждом тике принимала бы его за ручной
+# старт, ждала 90с под локом и гасила снова. Время старта берётся из
+# /proc/<pid>/stat (поле 22, в тиках по 1/100 с) и переводится в эпоху через
+# аптайм. Нет процесса или не прочиталось, значит "не позже".
+sing_box_started_after() {
+    local pid ticks up now started
+    pid=$(ps w 2>/dev/null | grep -v grep | grep "$SING_BOX_BIN run" | awk '{print $1; exit}')
+    [ -n "$pid" ] || return 1
+    ticks=$(cut -d' ' -f22 "/proc/$pid/stat" 2>/dev/null)
+    up=$(cut -d' ' -f1 /proc/uptime 2>/dev/null); up="${up%%.*}"
+    now=$(date +%s)
+    case "$ticks$up" in ""|*[!0-9]*) return 1 ;; esac
+    started=$((now - up + ticks / 100))
+    [ "$started" -gt "$1" ]
+}
+
 handle_degraded() {
     local now last wait_for next
+
+    handle_foreign_start && return 0
 
     # ПЕРВЫМ делом — независимо от прокси и от таймеров. Если первое гашение
     # не смогло вернуть dnsmasq (force_restore_dns это честно допускает и
@@ -917,6 +1121,10 @@ handle_degraded() {
     state_put "$F_RECOVERY" "$now"
 
     if ! probe_proxy_host; then
+        # Раньше эта ветка молчала: по логу было видно, когда podkop погасили и
+        # когда подняли, но не что происходило между. Строка на попытку, а не на
+        # тик: попытки идут раз в 5-30 минут.
+        log warn "попытка подъёма: прокси-хост $(proxy_endpoint || echo '?') не отвечает, следующая через ${wait_for}с; $(direct_summary)"
         return 0
     fi
     log info "прокси-хост снова отвечает, поднимаю podkop"
@@ -935,15 +1143,10 @@ handle_degraded() {
             state_put "$F_BACKOFF" "$next"
             log warn "цепочка поднялась, но upstream DNS молчит — остаюсь на прямом интернете, следующая попытка через ${next}с"
             podkop_down
+            log info "$(direct_summary)"
             return 0
         fi
-        state_put "$F_MODE" armed
-        state_put "$F_FAILS" 0
-        state_put "$F_BACKOFF" "$RECOVERY_EVERY"
-        # Прошлый рестарт относился к уже закрытой аварии: не давать ему
-        # запрещать первый рестарт в следующей.
-        state_put "$F_LAST_RESTART" 0
-        state_put "$F_DNS_FAILS" 0
+        go_armed
         log info "podkop восстановлен, режим armed"
     else
         # Хост отвечает по TCP, а цепочка не работает: протух ключ, сменился
@@ -953,8 +1156,9 @@ handle_degraded() {
         next=$((wait_for * 2))
         [ "$next" -gt "$RECOVERY_MAX" ] && next="$RECOVERY_MAX"
         state_put "$F_BACKOFF" "$next"
-        log warn "podkop поднялся, но цепочка не работает — гашу обратно, следующая попытка через ${next}с"
+        log warn "podkop поднялся, но цепочка не работает (после ожидания: $(chain_diag)) — гашу обратно, следующая попытка через ${next}с"
         podkop_down
+        log info "$(direct_summary)"
     fi
 }
 
@@ -1444,11 +1648,11 @@ action="${1:-check}"
 # и молча завершалась с кодом 0 — человек, которому по телефону диктуют
 # команду, видел бы пустой экран вместо подсказки.
 case "$action" in
-    check|boot|ddns|status|"") ;;
-    *) echo "usage: $0 [check|boot|ddns|status]" >&2; exit 1 ;;
+    check|boot|ddns|status|log|"") ;;
+    *) echo "usage: $0 [check|boot|ddns|status|log [строк]]" >&2; exit 1 ;;
 esac
 
-# status — только чтение, и звать его будут как раз тогда, когда идёт долгий
+# status и log — только чтение, и звать их будут как раз тогда, когда идёт долгий
 # прогон (человек полез смотреть, «почему всё легло»). Под общей блокировкой
 # он бы молча напечатал пустоту. Поэтому лок для него не берём.
 if [ "$action" = "boot" ]; then
@@ -1484,7 +1688,7 @@ elif [ "$action" = "ddns" ]; then
         fi
         sleep 5
     done
-elif [ "$action" != "status" ]; then
+elif [ "$action" != "status" ] && [ "$action" != "log" ]; then
     exec 9>"$F_LOCK"
     flock -n 9 || exit 0
 fi
@@ -1536,6 +1740,7 @@ case "$action" in
         if podkop_intercept_active; then echo "PodkopTable на месте"; else echo "PodkopTable НЕТ"; fi
         printf 'dnsmasq:    '
         uci -q get dhcp.@dnsmasq[0].server | tr '\n' ' '; echo
+        printf 'журнал:     %s (строк: %s)\n' "$JOURNAL" "$(cat "$JOURNAL" 2>/dev/null | wc -l)"
         printf 'ddns:       '
         if [ -f "$DDNS_CONF" ]; then
             grep -v '^[[:space:]]*#' "$DDNS_CONF" | grep -v '^[[:space:]]*$' | tr '\n' ';' ; echo
@@ -1546,6 +1751,25 @@ case "$action" in
     ddns)
         handle_ddns
         ;;
+    log)
+        # Ровно то, что просят прочитать по телефону после аварии: хвост журнала.
+        # Число проверяем, иначе `tail -n abc` ответит невнятной ошибкой busybox.
+        lines="${2:-50}"
+        case "$lines" in ""|*[!0-9]*) echo "usage: $0 log [строк]" >&2; exit 1 ;; esac
+        if [ -s "$JOURNAL" ]; then
+            tail -n "$lines" "$JOURNAL"
+        else
+            echo "журнал $JOURNAL пуст или его нет: сторож ещё ничего не записал (или флеш не принимает запись)"
+        fi
+        # Повторы, погашенные в текущем часе, в журнал попадут только по его
+        # истечении. Без этого блока идущая прямо сейчас авария выглядела бы как
+        # одна старая строка.
+        if [ -s "$F_JSEEN" ]; then
+            awk -F '\t' '{ split($1, h, " "); if (h[3] > 0)
+                print "  сейчас гасится: ещё " h[3] " раз, последний в " h[2] ": " $2 }' \
+                "$F_JSEEN" 2>/dev/null
+        fi
+        ;;
     check|"")
         if [ "$(state_get "$F_MODE" armed)" = "degraded" ]; then
             handle_degraded
@@ -1554,7 +1778,7 @@ case "$action" in
         fi
         ;;
     *)
-        echo "usage: $0 [check|boot|ddns|status]" >&2
+        echo "usage: $0 [check|boot|ddns|status|log [строк]]" >&2
         exit 1
         ;;
 esac

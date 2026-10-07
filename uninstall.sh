@@ -20,8 +20,9 @@
 # возвращённый домен обратно.
 #
 # Ключи:
-#   --purge            снести и файлы памяти синхронизации (/etc/podkop-ddns.conf и .bak)
-#   --keep-files       не трогать файлы памяти (поведение по умолчанию)
+#   --purge            снести и файлы памяти синхронизации (/etc/podkop-ddns.conf и .bak),
+#                      и журнал событий /etc/podkop-watchdog.log
+#   --keep-files       не трогать файлы памяти и журнал (поведение по умолчанию)
 #   --restore-domain   вернуть домен, не спрашивая; нужен при запуске без терминала
 #   --keep-ip          не возвращать домен и не спрашивать
 #
@@ -39,6 +40,7 @@ STATE_DIR="/tmp/podkop-watchdog"
 CONF="/etc/podkop-watchdog.conf"
 DDNS_CONF="/etc/podkop-ddns.conf"
 DDNS_BAK="/etc/podkop-ddns.bak"
+JOURNAL="/etc/podkop-watchdog.log"
 LOCK_WAIT=180     # сек ожидания чужого прогона watchdog
 START_WAIT=90     # сек ожидания подъёма podkop из degraded
 
@@ -468,7 +470,11 @@ main() {
         else
             warn "podkop не поднялся за ${START_WAIT}с."
             warn "Интернет сейчас идёт НАПРЯМУЮ — это рабочее состояние, но без прокси."
-            warn "Разбирайся: logread | tail -50   и   /etc/init.d/podkop restart"
+            if [ "$PURGE" = "1" ]; then
+                warn "Разбирайся: logread | tail -50   и   /etc/init.d/podkop restart"
+            else
+                warn "Разбирайся: tail -50 $JOURNAL   и   /etc/init.d/podkop restart"
+            fi
         fi
     else
         ok "podkop не был погашен watchdog'ом, трогать его не нужно"
@@ -492,7 +498,7 @@ main() {
     if [ -f /etc/sysupgrade.conf ]; then
         cp /etc/sysupgrade.conf /etc/sysupgrade.conf.bak
         removed=0
-        for f in "$DEST" "$CONF" "$DDNS_CONF" "$DDNS_BAK"; do
+        for f in "$DEST" "$CONF" "$DDNS_CONF" "$DDNS_BAK" "$JOURNAL"; do
             grep -qxF "$f" /etc/sysupgrade.conf 2>/dev/null || continue
             grep -vxF "$f" /etc/sysupgrade.conf > /tmp/sysupgrade.conf.new 2>/dev/null \
                 && mv /tmp/sysupgrade.conf.new /etc/sysupgrade.conf \
@@ -534,11 +540,15 @@ main() {
         rm -f "$DDNS_CONF" "$DDNS_BAK"
         ok "файлы памяти синхронизации удалены (--purge)"
         [ -n "$domain_note" ] && warn "в них был записан домен: $domain_note"
+        rm -f "$JOURNAL" "$JOURNAL.new" && ok "журнал событий удалён (--purge)"
     else
         if [ -f "$DDNS_CONF" ] || [ -f "$DDNS_BAK" ]; then
             ok "файлы памяти синхронизации ОСТАВЛЕНЫ: $DDNS_CONF, $DDNS_BAK"
             [ -n "$domain_note" ] && say "    записанный там домен: $domain_note"
         fi
+        # Журнал оставляем по той же логике: снимают сторожа чаще всего после
+        # аварии, и история того, что он делал, нужна как раз тогда.
+        [ -f "$JOURNAL" ] && ok "журнал событий ОСТАВЛЕН: $JOURNAL"
     fi
 
     # --- 7. что осталось --------------------------------------------------
