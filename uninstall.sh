@@ -144,10 +144,22 @@ ps_is_ipv4_literal() {
     esac
 }
 
+# Секция, где proxy_string и правда в деле: режим url. В urltest и selector
+# podkop её не читает, и возвращать туда домен значит делать commit и рестарт
+# podkop ради опции, которой никто не пользуется. Тот же признак, что
+# ddns_section_active в podkop-watchdog: разъедутся, и сторож и деинсталлятор
+# поспорят, какая секция живая.
+ps_section_active() {
+    [ "$(uci -q get "podkop.$1.connection_type")" = "proxy" ] \
+        && [ "$(uci -q get "podkop.$1.proxy_config_type")" = "url" ]
+}
+
 # Сложить в LEFT_ON_IP все домены из памяти, чьи секции сейчас стоят на IP.
 # Нужна на ранних выходах из restore_domains: инвариант "домен, который мы не
 # вернули, обязан быть назван в конце" держится и тогда, когда до разбора по
-# секциям дело не дошло.
+# секциям дело не дошло. Режим секции здесь не важен: IP в неактивной
+# proxy_string тоже наш, и вернётся человек в режим url, получит его уже без
+# сторожа.
 left_on_ip_from_memory() {
     local section domain ip rest ps
     [ -f "$DDNS_CONF" ] || return 0
@@ -204,6 +216,16 @@ restore_domains() {
         case "$section" in ""|\#*) section=""; continue ;; esac
         ps=$(uci -q get "podkop.$section.proxy_string")
         if [ -z "$ps" ]; then section=""; continue; fi
+        # Неактивную секцию не возвращаем (рестарт ради опции, которую podkop не
+        # читает), но наш IP в ней назвать обязаны: см. left_on_ip_from_memory.
+        if ! ps_section_active "$section"; then
+            ok "секция '$section' не в режиме url, домен не возвращаю"
+            if ps_parse "$ps" && ps_is_ipv4_literal "$PS_HOST" \
+               && [ -n "${domain:-}" ] && [ "$domain" != "-" ]; then
+                LEFT_ON_IP="${LEFT_ON_IP}${LEFT_ON_IP:+, }$domain"
+            fi
+            section=""; continue
+        fi
         if ! ps_parse "$ps"; then
             warn "секция '$section': строку подключения не разобрал, не трогаю"
             ps_is_ipv4_literal "$PS_HOST" && LEFT_ON_IP="${LEFT_ON_IP}${LEFT_ON_IP:+, }${domain:-?}"

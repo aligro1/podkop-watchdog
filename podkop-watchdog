@@ -497,42 +497,111 @@ probe_target_proxied() {
     esac
 }
 
-# Хост VLESS-сервера из конфига podkop, в виде "host:port".
+# Ссылки на серверы, которыми секция может пользоваться СЕЙЧАС, по одной в строке.
+# Выбор по proxy_config_type повторяет configure_outbound_handler из самого podkop:
+# url берёт одну proxy_string, urltest и selector свои списки, outbound JSON без
+# ссылки. LuCI при переключении режима стирает опции чужого режима, а `uci set`
+# руками нет, и брать их "что найдётся" значит проверять сервер, которым никто
+# не пользуется. Списки uci отдаёт через пробел, и podkop режет их так же
+# (`for link in $urltest_proxy_links`), поэтому разбор совпадает с его.
+# urltest_fallback_links (podkop 0.7.23+): серверы, на которые sing-box уходит,
+# когда не отвечает ни один основной. podkop их отбрасывает, если sing-box не умеет
+# urltest.fallbacks; тогда живой запасной поднимет podkop зря, wait_for_chain
+# погасит его обратно, и это та же цена, что у приближения для selector ниже. Без них проба в аварии видела бы только
+# мёртвые основные и держала дом без туннеля при живом запасном.
+section_links() {
+    [ "$(uci -q get "podkop.$1.connection_type")" = "proxy" ] || return 1
+    case "$(uci -q get "podkop.$1.proxy_config_type")" in
+        url)      uci -q get "podkop.$1.proxy_string" ;;
+        urltest)  { uci -q get "podkop.$1.urltest_proxy_links"
+                    uci -q get "podkop.$1.urltest_fallback_links"; } | tr ' ' '\n' ;;
+        selector) uci -q get "podkop.$1.selector_proxy_links" | tr ' ' '\n' ;;
+        *)        return 1 ;;
+    esac
+}
+
+# Хост сервера из одной ссылки, в виде "host:port".
 # Ключи и UUID не трогаем и никуда не пишем — берём только адрес.
-proxy_endpoint() {
-    local s ps_val ep
-    for s in $(uci -q show podkop | sed -n 's/^podkop\.\([a-z0-9_]*\)=section$/\1/p'); do
-        ps_val=$(uci -q get "podkop.$s.proxy_string") || continue
-        [ -n "$ps_val" ] || continue
-        ep=$(printf '%s' "$ps_val" \
-            | sed -e 's|^[a-z0-9+.-]*://||' -e 's|^[^@]*@||' -e 's|[?#/].*||')
-        # Разбор рассчитан на схему scheme://creds@host:port (vless, и это
-        # единственный формат, который тут используется). У legacy ss:// весь
-        # секрет лежит одним base64-блоком БЕЗ '@' — тогда sed вернёт его
-        # целиком, и `status` напечатает пароль открытым текстом. Поэтому
-        # отдаём результат, только если он и правда похож на host:port.
-        case "$ep" in
-            ""|*[!]A-Za-z0-9.:_[-]*) continue ;;
-            *:*) [ "${#ep}" -le 80 ] && { printf '%s' "$ep"; return 0; } ;;
-        esac
-    done
+link_endpoint() {
+    local ep
+    ep=$(printf '%s' "$1" \
+        | sed -e 's|^[a-z0-9+.-]*://||' -e 's|^[^@]*@||' -e 's|[?#/].*||')
+    # Разбор рассчитан на схему scheme://creds@host:port (vless, и это
+    # единственный формат, который тут используется). У legacy ss:// весь
+    # секрет лежит одним base64-блоком БЕЗ '@', и тогда sed вернёт его
+    # целиком, и `status` напечатает пароль открытым текстом. Поэтому
+    # отдаём результат, только если он и правда похож на host:port.
+    case "$ep" in
+        ""|*[!]A-Za-z0-9.:_[-]*) return 1 ;;
+        *:*) [ "${#ep}" -le 80 ] && { printf '%s' "$ep"; return 0; } ;;
+    esac
     return 1
 }
 
-# Жив ли сам сервер на TCP-уровне. busybox nc умеет только "nc IP PORT"
+# Все серверы всех секций, "host:port" по одному в строке, без повторов.
+# Ссылка, которую link_endpoint не разобрал (legacy ss:// без '@', слишком
+# длинный хост), отдаётся строкой "-": молча выкинуть её нельзя, иначе проба
+# судила бы только по разобранным и при живом неразобранном сервере держала
+# дом без туннеля. Код возврата 0, только если разобран хоть один адрес.
+proxy_endpoints() {
+    local s link ep out=""
+    for s in $(uci -q show podkop | sed -n 's/^podkop\.\([a-z0-9_]*\)=section$/\1/p'); do
+        for link in $(section_links "$s"); do
+            ep=$(link_endpoint "$link") || ep="-"
+            out="$out$ep
+"
+        done
+    done
+    printf '%s' "$out" | awk '!seen[$0]++'
+    printf '%s' "$out" | grep -qv '^-$'
+}
+
+# Жив ли хоть один сервер на TCP-уровне. busybox nc умеет только "nc IP PORT"
 # (ни -z, ни -w), поэтому проверяем curl'ом. Успех считаем ТОЛЬКО по rc=0:
 # перечислять коды «недоступен» списком нельзя — в него легко не попасть.
 # Например rc=6 (имя не резолвится) до TCP вообще не доходит, но при подходе
 # «всё, кроме 7 и 28, значит дошло» читался бы как живой сервер.
 # Сервер за REALITY на rc=0 отвечает штатно: TLS поднимается до сайта-маскировки.
+#
+# "Хоть один", а не "все": в urltest sing-box сам уйдёт на живой сервер, и
+# ждать воскрешения второго значит держать дом без туннеля, когда он мог бы
+# работать. Для selector это приближение: выбранный вручную сервер может быть
+# как раз мёртвым. Ошибку ловит wait_for_chain после подъёма и гасит обратно.
+# Ответивший сервер кладётся в PROXY_ALIVE, для строки журнала.
+# Неразобранная ссылка ("-") проверке не поддаётся, и если все разобранные
+# мертвы, решаем как раньше при неразобранном адресе: поднимаем вслепую. Тогда
+# PROXY_ALIVE="?", и строка журнала говорит именно это, а не "сервер ответил".
+PROXY_ALIVE=""
+
+# Серверы одной строкой через запятую: для журнала и status.
+# Код возврата берём у proxy_endpoints, а не у конвейера: awk вернул бы 0 на
+# пустом входе, и вызывающее `|| echo '(не распознан)'` не сработало бы никогда.
+proxy_endpoints_line() {
+    local eps
+    eps=$(proxy_endpoints) || return 1
+    printf '%s\n' "$eps" | awk '$0 == "-" { $0 = "(ссылка не разобрана)" }
+                                NR > 1 { printf ", " } { printf "%s", $0 }'
+}
 probe_proxy_host() {
-    local ep
-    ep=$(proxy_endpoint) || {
+    local eps ep blind=0
+    eps=$(proxy_endpoints) || {
         log warn "не удалось разобрать адрес прокси из конфига — пробую поднять podkop вслепую"
+        PROXY_ALIVE="?"
         return 0
     }
-    [ -n "$ep" ] || return 0
-    curl -sk --connect-timeout 6 --max-time 8 -o /dev/null "https://$ep" 2>/dev/null
+    for ep in $eps; do
+        [ "$ep" = "-" ] && { blind=1; continue; }
+        if curl -sk --connect-timeout 6 --max-time 8 -o /dev/null "https://$ep" 2>/dev/null; then
+            PROXY_ALIVE="$ep"
+            return 0
+        fi
+    done
+    if [ "$blind" = 1 ]; then
+        log warn "разобранные серверы не отвечают, а часть ссылок не разобрана, пробую поднять podkop вслепую"
+        PROXY_ALIVE="?"
+        return 0
+    fi
+    return 1
 }
 
 # Сводка "жив ли прямой интернет" одной строкой для журнала. Звать только при
@@ -1124,10 +1193,14 @@ handle_degraded() {
         # Раньше эта ветка молчала: по логу было видно, когда podkop погасили и
         # когда подняли, но не что происходило между. Строка на попытку, а не на
         # тик: попытки идут раз в 5-30 минут.
-        log warn "попытка подъёма: прокси-хост $(proxy_endpoint || echo '?') не отвечает, следующая через ${wait_for}с; $(direct_summary)"
+        log warn "попытка подъёма: прокси-хост $(proxy_endpoints_line || echo '?') не отвечает, следующая через ${wait_for}с; $(direct_summary)"
         return 0
     fi
-    log info "прокси-хост снова отвечает, поднимаю podkop"
+    if [ "$PROXY_ALIVE" = "?" ]; then
+        log info "поднимаю podkop вслепую"
+    else
+        log info "прокси-хост $PROXY_ALIVE снова отвечает, поднимаю podkop"
+    fi
 
     run_bounded 60 /etc/init.d/podkop start
 
@@ -1412,10 +1485,22 @@ ddns_valid_domain() {
 }
 
 # Секции podkop, у которых вообще есть подключение.
-# Паттерн имени ОБЯЗАН совпадать с proxy_endpoint: разъедутся — секция будет
+# Паттерн имени ОБЯЗАН совпадать с proxy_endpoints: разъедутся, секция будет
 # синхронизироваться, но не показываться в `status`, и наоборот.
 ddns_sections() {
     uci -q show podkop | sed -n 's/^podkop\.\([a-z0-9_]*\)=section$/\1/p'
+}
+
+# Синхронизация действует только в режиме url: там адрес один и podkop берёт его
+# из proxy_string. В urltest и selector серверы лежат списком, и proxy_string
+# podkop не читает вовсе, даже если она осталась от прежнего режима. Синхронизировать
+# её значит перезапускать podkop ради опции, которой никто не пользуется.
+# Подставлять IP в сами списки сторож не умеет: домены там резолвит sing-box, и
+# если внешний DNS лежит, туннель к ним не поднимется. Это известная дыра, а не
+# решение "так безопасно": защищает тогда только гашение podkop.
+ddns_section_active() {
+    [ "$(uci -q get "podkop.$1.connection_type")" = "proxy" ] \
+        && [ "$(uci -q get "podkop.$1.proxy_config_type")" = "url" ]
 }
 
 # Строка памяти: "<секция> <домен> <IP, поставленный синхронизацией>".
@@ -1576,11 +1661,48 @@ ddns_sync_one() {
 # Идём по секциям podkop, а не по строкам $DDNS_CONF: источник правды — то, что
 # человек вписал в LuCI. Запись в файле, для которой секции больше нет, просто
 # лежит мёртвым грузом и ни на что не влияет.
+ddns_has_work() {
+    local s
+    [ -f "$DDNS_CONF" ] && grep -qv '^[[:space:]]*\(#\|$\)' "$DDNS_CONF" && return 0
+    for s in $(ddns_sections); do
+        ddns_section_active "$s" && [ -n "$(uci -q get "podkop.$s.proxy_string")" ] && return 0
+    done
+    return 1
+}
+
 handle_ddns() {
     local section ps host domain known
 
+    # Пока в podkop есть несохранённые правки (Save без Apply в LuCI), конфиг
+    # это черновик: CLI-шный uci читает его вместе с дельтами. По черновику нельзя
+    # ни стирать память, ни решать "адрес сменили руками": человек нажмёт Revert,
+    # в конфиге вернётся наш IP, а памяти уже нет, и синхронизация замолчит
+    # навсегда. Строка в журнал та же, что в ddns_sync_one: по ней одной видно,
+    # что застрял наш собственный commit (переполненный /overlay), а не LuCI.
+    # Жалуемся, только если синхронизации тут вообще есть дело: секция в режиме
+    # url со строкой или запись в памяти. Иначе человек в urltest или VPN раз в
+    # час читал бы про "адрес не трогаю" за каждый Save без Apply.
+    if uci_has_foreign_changes podkop; then
+        ddns_has_work || return 0
+        ddns_moan "ddns: в конфиге podkop есть незакоммиченные правки (кто-то в LuCI?), адрес не трогаю до следующего тика. Если LuCI закрыт, а строка повторяется, это мог не записаться наш собственный commit: смотри 'df /overlay' и 'uci changes podkop'"
+        return 0
+    fi
+
     for section in $(ddns_sections); do
         ps=$(uci -q get "podkop.$section.proxy_string")
+        if ! ddns_section_active "$section"; then
+            # Секцию перевели в другой режим, и LuCI стёрла proxy_string. Память
+            # теперь описывает адрес, которого нет: вернуть домен некуда,
+            # синхронизировать нечего, а status показывал бы её как действующую.
+            # Если proxy_string уцелела, память оставляем: вернётся человек в
+            # режим url с тем же IP, синхронизация продолжится с того же места.
+            domain=$(ddns_conf_get "$section")
+            if [ -z "$ps" ] && [ -n "$domain" ]; then
+                log info "ddns: секция '$section' больше не в режиме url и proxy_string в ней нет, забываю домен $domain"
+                ddns_conf_del "$section"
+            fi
+            continue
+        fi
         [ -n "$ps" ] || continue
         ddns_parse_url "$ps" || {
             ddns_moan "ddns: не разобрал proxy_string секции '$section' — пропускаю"
@@ -1638,7 +1760,8 @@ handle_ddns() {
 mkdir -p "$STATE_DIR"
 
 # Один экземпляр за раз: прогон с рестартом длится до ~35с, а ветка подъёма
-# из degraded в худшем случае (start не помог, откат обратно) — около 150с,
+# из degraded в худшем случае (start не помог, откат обратно) около 150с плюс
+# до 8с на каждый лишний сервер в пробе,
 # то есть заведомо дольше минутного тика cron. Пропущенные тики тихо выходят
 # по flock -n, это штатно; в логе они выглядят как «пропавшие» минуты.
 action="${1:-check}"
@@ -1705,7 +1828,7 @@ case "$action" in
     status)
         echo "режим:      $(state_get "$F_MODE" armed)"
         echo "провалов:   $(state_get "$F_FAILS" 0)"
-        echo "прокси:     $(proxy_endpoint || echo '(не распознан)')"
+        echo "прокси:     $(proxy_endpoints_line || echo '(не распознан)')"
         echo "сайт:       $PROBE_HOST"
         # Иначе человек, поставивший off и забывший, ищет причину тишины в логе
         # вслепую. Строка печатается в stdout, её фильтр уровня не касается.
@@ -1741,9 +1864,22 @@ case "$action" in
         printf 'dnsmasq:    '
         uci -q get dhcp.@dnsmasq[0].server | tr '\n' ' '; echo
         printf 'журнал:     %s (строк: %s)\n' "$JOURNAL" "$(cat "$JOURNAL" 2>/dev/null | wc -l)"
+        # Запись секции, ушедшей из режима url, синхронизация не трогает. Без
+        # пометки она читалась бы как работающая, так и было после перехода на
+        # urltest: в status висел домен, который никто не синхронизировал.
         printf 'ddns:       '
         if [ -f "$DDNS_CONF" ]; then
-            grep -v '^[[:space:]]*#' "$DDNS_CONF" | grep -v '^[[:space:]]*$' | tr '\n' ';' ; echo
+            ddns_lines=$(grep -v '^[[:space:]]*#' "$DDNS_CONF" | grep -v '^[[:space:]]*$' \
+                | while read -r s d ip rest; do
+                    if ddns_section_active "$s"; then
+                        printf '%s %s %s; ' "$s" "$d" "$ip"
+                    elif [ -z "$(uci -q get "podkop.$s")" ]; then
+                        printf '%s %s %s (не действует: секции нет в podkop); ' "$s" "$d" "$ip"
+                    else
+                        printf '%s %s %s (не действует: секция не в режиме url); ' "$s" "$d" "$ip"
+                    fi
+                done)
+            echo "${ddns_lines:-записей нет}"
         else
             echo "не настроен ($DDNS_CONF нет)"
         fi
